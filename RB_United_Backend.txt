@@ -1,0 +1,283 @@
+/**
+ * RB United backend (Google Apps Script).
+ * Bound to ONE Google Sheet. Keeps the sheet private and serves only safe data to the website.
+ *
+ * Tabs (created by setup()):
+ *   Requests    - every registration. YOU change "status" to Approved after you verify payment on WhatsApp.
+ *   Accounts    - login records (phone + hashed PIN). Do not edit.
+ *   Players     - shown in "Meet the players". Filled automatically when a player makes an account. You can add rows by hand too.
+ *   Leadership  - friends / admins shown on the site. You edit this.
+ *   Matches     - next match, fixtures and results. You edit this.
+ *   Settings    - prices and home ground. You edit this.
+ */
+
+var SHEETS = {
+  Requests:   ['id', 'time', 'name', 'phone', 'position', 'pass', 'group', 'message', 'status'],
+  Accounts:   ['phone', 'hash', 'salt', 'requestId', 'created'],
+  Players:    ['id', 'number', 'name', 'position', 'role', 'age', 'details', 'photo', 'show'],
+  Leadership: ['name', 'role', 'photo'],
+  Matches:    ['date', 'time', 'opponent', 'type', 'venue', 'result'],
+  Settings:   ['key', 'value']
+};
+var POSITIONS = ['GK', 'DEF', 'MID', 'FWD', 'SUP'];
+var PASSES = ['Solo Pass', 'Group Pass'];
+
+/* ---------------- one-time setup: run this once from the editor ---------------- */
+function setup() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  Object.keys(SHEETS).forEach(function (name) {
+    var sh = ss.getSheetByName(name) || ss.insertSheet(name);
+    var heads = SHEETS[name];
+    sh.getRange(1, 1, 1, heads.length).setValues([heads]).setFontWeight('bold');
+    sh.setFrozenRows(1);
+  });
+  // keep phone numbers, dates and times as plain text so they never get reformatted
+  ss.getSheetByName('Requests').getRange('D2:D2000').setNumberFormat('@');
+  ss.getSheetByName('Accounts').getRange('A2:A2000').setNumberFormat('@');
+  ss.getSheetByName('Matches').getRange('A2:B500').setNumberFormat('@');
+  ss.getSheetByName('Players').getRange('B2:B500').setNumberFormat('@');
+  // dropdowns
+  var st = SpreadsheetApp.newDataValidation().requireValueInList(['Pending', 'Approved', 'Rejected'], true).build();
+  ss.getSheetByName('Requests').getRange('I2:I2000').setDataValidation(st);
+  var yn = SpreadsheetApp.newDataValidation().requireValueInList(['Yes', 'No'], true).build();
+  ss.getSheetByName('Players').getRange('I2:I500').setDataValidation(yn);
+  // default settings
+  var set = ss.getSheetByName('Settings');
+  if (set.getLastRow() < 2) {
+    set.getRange(2, 1, 3, 2).setValues([['priceSolo', ''], ['priceGroup', ''], ['ground', '']]);
+  }
+  var old = ss.getSheetByName('Sheet1');
+  if (old && old.getLastRow() <= 1 && ss.getSheets().length > 1) ss.deleteSheet(old);
+  var props = PropertiesService.getScriptProperties();
+  if (!props.getProperty('pepper')) props.setProperty('pepper', Utilities.getUuid() + Utilities.getUuid());
+  DriveApp.getRootFolder(); // makes Google ask for Drive permission now (used for player photos)
+  Logger.log('Setup done. Now: Deploy > New deployment > Web app.');
+}
+
+/* ---------------- helpers ---------------- */
+function ss_() { return SpreadsheetApp.getActiveSpreadsheet(); }
+function tz_() { return ss_().getSpreadsheetTimeZone() || 'Asia/Dhaka'; }
+
+function readAll_(name) {
+  var sh = ss_().getSheetByName(name);
+  if (!sh) return [];
+  var v = sh.getDataRange().getValues();
+  if (v.length < 2) return [];
+  var head = v[0], out = [];
+  for (var i = 1; i < v.length; i++) {
+    var o = { _row: i + 1 }, any = false;
+    for (var j = 0; j < head.length; j++) {
+      o[head[j]] = v[i][j];
+      if (String(v[i][j]).trim() !== '') any = true;
+    }
+    if (any) out.push(o);
+  }
+  return out;
+}
+function txt_(v, kind) {
+  if (Object.prototype.toString.call(v) === '[object Date]') {
+    return Utilities.formatDate(v, tz_(), kind === 'time' ? 'HH:mm' : 'yyyy-MM-dd');
+  }
+  return v == null ? '' : String(v).trim();
+}
+function clean_(v, max, keepNewlines) {
+  v = String(v == null ? '' : v);
+  v = keepNewlines ? v.replace(/[\u0000-\u0009\u000b\u000c\u000e-\u001f]/g, ' ') : v.replace(/[\u0000-\u001f]/g, ' ');
+  v = v.trim().slice(0, max);
+  return v.replace(/^[=+\-@\s]+/, ''); // block spreadsheet formula injection
+}
+function phoneKey_(p) {
+  var d = String(p == null ? '' : p).replace(/\D/g, '');
+  return d.length >= 10 && d.length <= 15 ? d.slice(-10) : '';
+}
+function json_(o) {
+  return ContentService.createTextOutput(JSON.stringify(o)).setMimeType(ContentService.MimeType.JSON);
+}
+function sha_(s) {
+  return Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, s, Utilities.Charset.UTF_8)
+    .map(function (b) { return ('0' + (b < 0 ? b + 256 : b).toString(16)).slice(-2); }).join('');
+}
+function hashPin_(pin, salt) {
+  return sha_(PropertiesService.getScriptProperties().getProperty('pepper') + salt + pin);
+}
+function throttle_(key) { // 5 wrong tries, then 15 minutes lock
+  var n = Number(CacheService.getScriptCache().get('f_' + key) || 0);
+  return n >= 5;
+}
+function fail_(key) {
+  var c = CacheService.getScriptCache(), n = Number(c.get('f_' + key) || 0) + 1;
+  c.put('f_' + key, String(n), 900);
+}
+function ok_(key) { CacheService.getScriptCache().remove('f_' + key); }
+
+/* ---------------- public data ---------------- */
+function publicData_() {
+  var settings = {};
+  readAll_('Settings').forEach(function (r) { if (r.key) settings[String(r.key)] = txt_(r.value); });
+  return {
+    ok: true,
+    registered: readAll_('Requests').filter(function (r) { return String(r.status).toLowerCase() === 'approved'; })
+      .map(function (r) { return { name: txt_(r.name), position: txt_(r.position), pass: txt_(r.pass) }; }),
+    players: readAll_('Players').filter(function (p) { return txt_(p.name) && String(p.show).toLowerCase() !== 'no'; })
+      .map(function (p) {
+        return { number: txt_(p.number), name: txt_(p.name), position: txt_(p.position), role: txt_(p.role),
+                 age: txt_(p.age), details: txt_(p.details), photo: txt_(p.photo) };
+      }),
+    leaders: readAll_('Leadership').filter(function (l) { return txt_(l.name); })
+      .map(function (l) { return { name: txt_(l.name), role: txt_(l.role), photo: txt_(l.photo) }; }),
+    matches: readAll_('Matches').filter(function (m) { return txt_(m.opponent); })
+      .map(function (m) {
+        return { date: txt_(m.date, 'date'), time: txt_(m.time, 'time'), opponent: txt_(m.opponent), type: txt_(m.type),
+                 venue: txt_(m.venue), result: txt_(m.result) };
+      }),
+    settings: settings
+  };
+}
+
+/* ---------------- actions ---------------- */
+function register_(d) {
+  if (d.website) return { ok: true, id: 'RB-0000' };               // honeypot: bots fill this
+  var name = clean_(d.name, 60), key = phoneKey_(d.phone);
+  var pos = POSITIONS.indexOf(d.position) >= 0 ? d.position : '';
+  var pass = PASSES.indexOf(d.pass) >= 0 ? d.pass : '';
+  if (name.length < 2) return { ok: false, error: 'name' };
+  if (!key) return { ok: false, error: 'phone' };
+  if (!pos || !pass) return { ok: false, error: 'invalid' };
+  var cache = CacheService.getScriptCache();
+  if (cache.get('r_' + key)) return { ok: false, error: 'wait' };
+  cache.put('r_' + key, '1', 60);
+
+  var lock = LockService.getScriptLock(); lock.waitLock(10000);
+  try {
+    var rows = readAll_('Requests'), maxN = 0;
+    for (var i = 0; i < rows.length; i++) {
+      var n = parseInt(String(rows[i].id).replace(/\D/g, ''), 10) || 0;
+      if (n > maxN) maxN = n;
+      if (phoneKey_(rows[i].phone) === key && String(rows[i].status).toLowerCase() !== 'rejected') {
+        return { ok: true, id: String(rows[i].id), dup: true, status: txt_(rows[i].status) };
+      }
+    }
+    var id = 'RB-' + ('000' + (maxN + 1)).slice(-4);
+    ss_().getSheetByName('Requests').appendRow([id, new Date(), name, String(d.phone).replace(/\D/g, ''), pos, pass,
+      clean_(d.group, 60), clean_(d.message, 300), 'Pending']);
+    return { ok: true, id: id, status: 'Pending' };
+  } finally { lock.releaseLock(); }
+}
+
+function findApproved_(key) {
+  var rows = readAll_('Requests'), best = null;
+  for (var i = 0; i < rows.length; i++) {
+    if (phoneKey_(rows[i].phone) !== key) continue;
+    if (!best || String(rows[i].status).toLowerCase() === 'approved') best = rows[i];
+  }
+  return best;
+}
+function findAccount_(key) {
+  var rows = readAll_('Accounts');
+  for (var i = 0; i < rows.length; i++) if (phoneKey_(rows[i].phone) === key) return rows[i];
+  return null;
+}
+function upsertPlayer_(req, fields) {
+  var sh = ss_().getSheetByName('Players'), rows = readAll_('Players'), row = null;
+  for (var i = 0; i < rows.length; i++) if (String(rows[i].id) === String(req.id)) { row = rows[i]; break; }
+  var head = SHEETS.Players;
+  if (!row) {
+    var o = { id: req.id, number: '', name: txt_(req.name), position: txt_(req.position), role: '', age: '', details: '', photo: '', show: 'Yes' };
+    for (var k in fields) o[k] = fields[k];
+    sh.appendRow(head.map(function (h) { return o[h]; }));
+    return;
+  }
+  for (var f in fields) {
+    var col = head.indexOf(f) + 1;
+    if (col > 0) sh.getRange(row._row, col).setValue(fields[f]);
+  }
+}
+function profile_(req, acc) {
+  var p = null, rows = readAll_('Players');
+  for (var i = 0; i < rows.length; i++) if (String(rows[i].id) === String(req.id)) { p = rows[i]; break; }
+  return { ok: true, name: txt_(req.name), position: txt_(req.position), pass: txt_(req.pass), group: txt_(req.group),
+           id: txt_(req.id), number: p ? txt_(p.number) : '', age: p ? txt_(p.age) : '', details: p ? txt_(p.details) : '',
+           photo: p ? txt_(p.photo) : '' };
+}
+
+function signup_(d) {
+  var key = phoneKey_(d.phone), pin = String(d.pin || '');
+  if (!key) return { ok: false, error: 'phone' };
+  if (!/^\d{4,8}$/.test(pin)) return { ok: false, error: 'pin' };
+  if (throttle_(key)) return { ok: false, error: 'locked' };
+  var lock = LockService.getScriptLock(); lock.waitLock(10000);
+  try {
+    var req = findApproved_(key);
+    if (!req) { fail_(key); return { ok: false, error: 'no_request' }; }
+    if (String(req.status).toLowerCase() !== 'approved') return { ok: false, error: 'not_approved', status: txt_(req.status) };
+    if (findAccount_(key)) return { ok: false, error: 'exists' };
+    var salt = Utilities.getUuid();
+    ss_().getSheetByName('Accounts').appendRow([key, hashPin_(pin, salt), salt, req.id, new Date()]);
+    upsertPlayer_(req, {});
+    return profile_(req);
+  } finally { lock.releaseLock(); }
+}
+
+function auth_(d) {
+  var key = phoneKey_(d.phone), pin = String(d.pin || '');
+  if (!key || !pin) return { err: 'login' };
+  if (throttle_(key)) return { err: 'locked' };
+  var acc = findAccount_(key);
+  if (!acc || hashPin_(pin, String(acc.salt)) !== String(acc.hash)) { fail_(key); return { err: 'login' }; }
+  ok_(key);
+  var req = findApproved_(key);
+  if (!req || String(req.status).toLowerCase() !== 'approved') return { err: 'not_approved' };
+  return { req: req, acc: acc };
+}
+function login_(d) {
+  var a = auth_(d);
+  return a.err ? { ok: false, error: a.err } : profile_(a.req, a.acc);
+}
+
+function savePhoto_(dataUrl, oldUrl, id) {
+  var m = /^data:image\/(jpeg|png|webp);base64,([A-Za-z0-9+\/=]+)$/.exec(String(dataUrl || ''));
+  if (!m || m[2].length > 300000) return null;                      // about 220 KB max
+  var type = 'image/' + m[1];
+  var it = DriveApp.getFoldersByName('RB United Photos');
+  var folder = it.hasNext() ? it.next() : DriveApp.createFolder('RB United Photos');
+  var file = folder.createFile(Utilities.newBlob(Utilities.base64Decode(m[2]), type, id + '-' + Date.now() + '.' + m[1]));
+  file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+  var old = /[?&]id=([\w-]+)/.exec(String(oldUrl || ''));
+  if (old) { try { DriveApp.getFileById(old[1]).setTrashed(true); } catch (e) {} }
+  return 'https://drive.google.com/thumbnail?id=' + file.getId() + '&sz=w600';
+}
+function save_(d) {
+  var a = auth_(d);
+  if (a.err) return { ok: false, error: a.err };
+  var lock = LockService.getScriptLock(); lock.waitLock(10000);
+  try {
+    var cur = profile_(a.req, a.acc);
+    var fields = { age: clean_(d.age, 3), details: clean_(d.details, 400, true) };
+    if (d.photo) {
+      var url = savePhoto_(d.photo, cur.photo, a.req.id);
+      if (!url) return { ok: false, error: 'photo' };
+      fields.photo = url;
+    }
+    upsertPlayer_(a.req, fields);
+    return profile_(a.req, a.acc);
+  } finally { lock.releaseLock(); }
+}
+
+/* ---------------- web app entry points ---------------- */
+function doGet() { return json_(publicData_()); }
+
+function doPost(e) {
+  var d;
+  try { d = JSON.parse(e.postData.contents); } catch (x) { return json_({ ok: false, error: 'bad_request' }); }
+  try {
+    switch (d.action) {
+      case 'register': return json_(register_(d));
+      case 'signup':   return json_(signup_(d));
+      case 'login':    return json_(login_(d));
+      case 'save':     return json_(save_(d));
+    }
+    return json_({ ok: false, error: 'bad_request' });
+  } catch (err) {
+    return json_({ ok: false, error: 'server' });
+  }
+}
